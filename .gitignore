@@ -25,3 +25,8 @@ secrets/
 
 # Machine-local Claude Code settings (personal paths, never shared).
 .claude/settings.local.json
+
+# Local working notes (not deliverables; public repo)
+CLAUDE.md
+ROADMAP.md
+tasks/
