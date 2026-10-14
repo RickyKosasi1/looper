@@ -1617,14 +1617,17 @@ class BudgetTests(unittest.TestCase):
         python = Path(sys.executable).as_posix()
         host_invoke = f'["{python}", "{(FIXTURES / "fake_host.py").as_posix()}"]'
         invoke = [
-            claude.as_posix(), "-p", "--output-format", "json",
+            "-p", "--output-format", "json",
             argv_log.as_posix(), str(turns), str(usd_per_turn), "100",
             "--", python, (FIXTURES / "fake_host.py").as_posix(),
         ]
         text = (work / "loop.yaml").read_text(encoding="utf-8")
         self.assertIn(host_invoke, text)
+        # Native path, YAML single-quoted (no escapes): Windows runs a .cmd
+        # through cmd.exe, which can misread forward slashes as switches.
+        rendered = [f"'{claude}'"] + [f'"{item}"' for item in invoke]
         (work / "loop.yaml").write_text(
-            text.replace(host_invoke, "[" + ", ".join(f'"{item}"' for item in invoke) + "]"), encoding="utf-8"
+            text.replace(host_invoke, "[" + ", ".join(rendered) + "]"), encoding="utf-8"
         )
         self._compile(work)
         return argv_log
