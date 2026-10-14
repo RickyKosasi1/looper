@@ -8,9 +8,13 @@ Use this when setting gates, iteration caps, budgets, and stop conditions.
 - `gates.*.max_revisions`
 - `loop_control.no_progress.max_stalled_iterations`
 - At least one wall-clock, token, or USD budget cap when external models run.
-  The generated Python runner enforces wall-clock caps directly; token and USD
-  caps are advisory unless the chosen model CLI exposes accounting that the
-  loop operator wires in separately.
+  The generated Python runner enforces wall-clock caps directly, and token and
+  USD caps from the usage each call reports: invoke Claude as
+  `claude -p --output-format json` (tokens + cost) and Codex as
+  `codex exec --json` (tokens only). Caps fail closed: a USD cap with a Codex
+  or other non-Claude hosted member is refused, so cap such loops with tokens
+  instead. `looper lint` errors (`unmetered-budget`) on any cap the runner
+  cannot enforce.
 - A stop condition that describes success.
 - A stop condition that describes no-progress or repeated failure.
 

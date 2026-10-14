@@ -32,42 +32,58 @@ COMPILER = ROOT / "scripts" / "looper.py"
 
 # Fake host: argv[1] captures every prompt received; optional argv[2] names a
 # "leak file" whose content the host copies into the plan it drafts - the
-# legitimate path by which flagged content enters an artifact.
+# legitimate path by which flagged content enters an artifact. `--usage N`
+# wraps the reply in Claude's `-p --output-format json` envelope reporting N
+# tokens per call, as a metered CLI would.
 FAKE_HOST = '''
-import pathlib, sys
+import json, pathlib, sys
+args = sys.argv[1:]
+usage = None
+if "--usage" in args:
+    at = args.index("--usage")
+    usage = int(args[at + 1])
+    del args[at:at + 2]
 prompt = sys.stdin.read()
-capture = pathlib.Path(sys.argv[1])
+capture = pathlib.Path(args[0])
 previous = capture.read_text(encoding="utf-8") if capture.exists() else ""
 capture.write_text(previous + "\\n---CALL---\\n" + prompt, encoding="utf-8")
-leak = pathlib.Path(sys.argv[2]) if len(sys.argv) > 2 else None
+leak = pathlib.Path(args[1]) if len(args) > 1 else None
+out = []
 if "Revise the artifact" in prompt:
-    print("Revised artifact")
-    print()
-    print("Owner: host")
-    print("No TBD")
+    out += ["Revised artifact", "", "Owner: host", "No TBD"]
 elif "Draft plan.md" in prompt:
-    print("# Plan")
-    print()
-    print("Owner: host")
+    out += ["# Plan", "", "Owner: host"]
     if leak is not None and leak.exists():
-        print(leak.read_text(encoding="utf-8"))
-    print("No TBD")
+        out.append(leak.read_text(encoding="utf-8"))
+    out.append("No TBD")
 else:
-    print("# Delivery")
-    print()
-    print("Owner: host")
-    print("No TBD")
+    out += ["# Delivery", "", "Owner: host", "No TBD"]
+text = "\\n".join(out)
+if usage is None:
+    print(text)
+else:
+    print(json.dumps({
+        "type": "result", "subtype": "success", "is_error": False, "result": text,
+        "total_cost_usd": 0.0, "usage": {"input_tokens": usage // 2, "output_tokens": usage - usage // 2},
+    }))
 '''
 
 # Verdict-emitting judge: revises `revise_count` times, then passes; a
 # negative revise_count means revise forever with a UNIQUE blocking issue per
 # call (so no-progress detectors cannot mask a missing revision cap). Records
 # every prompt it receives so scenarios can assert what crossed the boundary.
+# `--usage N` wraps the verdict in Claude's JSON envelope, like FAKE_HOST.
 FAKE_JUDGE = '''
 import json, pathlib, sys
-state_path = pathlib.Path(sys.argv[1])
-revise_count = int(sys.argv[2])
-capture = pathlib.Path(sys.argv[3]) if len(sys.argv) > 3 else None
+args = sys.argv[1:]
+usage = None
+if "--usage" in args:
+    at = args.index("--usage")
+    usage = int(args[at + 1])
+    del args[at:at + 2]
+state_path = pathlib.Path(args[0])
+revise_count = int(args[1])
+capture = pathlib.Path(args[2]) if len(args) > 2 else None
 prompt = sys.stdin.read()
 if capture is not None:
     previous = capture.read_text(encoding="utf-8") if capture.exists() else ""
@@ -84,9 +100,29 @@ elif count < revise_count:
     verdict = {"verdict": "revise", "blocking_issues": ["Add an explicit owner."], "confidence": 0.9, "notes": ""}
 else:
     verdict = {"verdict": "pass", "blocking_issues": [], "confidence": 0.9, "notes": ""}
-print("```json")
-print(json.dumps(verdict))
-print("```")
+text = "```json\\n" + json.dumps(verdict) + "\\n```"
+if usage is None:
+    print(text)
+else:
+    print(json.dumps({
+        "type": "result", "subtype": "success", "is_error": False, "result": text,
+        "total_cost_usd": 0.0, "usage": {"input_tokens": usage // 2, "output_tokens": usage - usage // 2},
+    }))
+'''
+
+# Host that hangs after starting a "tool" in its own session (detached on
+# Windows), as Claude Code does for Bash tools. The tool appends to a file
+# named after its pid in argv[1] every 0.1s while alive.
+HANGING_HOST = '''
+import os, pathlib, subprocess, sys, time
+beats = pathlib.Path(sys.argv[1])
+beats.mkdir(parents=True, exist_ok=True)
+sys.stdin.read()
+tool = "import os, sys, time\\nwhile True:\\n    open(os.path.join(sys.argv[1], str(os.getpid())), 'a').write('.')\\n    time.sleep(0.1)"
+detach = ({"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
+          if os.name == "nt" else {"start_new_session": True})
+subprocess.Popen([sys.executable, "-c", tool, str(beats)], **detach)
+time.sleep(120)
 '''
 
 BAD_JUDGE = '''
@@ -135,6 +171,11 @@ class Harness:
         extra_context: str = "",
         max_revisions: int = 2,
         host_leak: str = "",
+        host_usage: int = 0,
+        judge_usage: int = 0,
+        budget_yaml: str = "",
+        hanging_host: bool = False,
+        wall_clock_min: str = "5",
     ) -> Path:
         """Write fixture scripts + loop.yaml into `work`, compile, return spec path."""
         fixtures = work / "fixtures"
@@ -142,6 +183,7 @@ class Harness:
         (fixtures / "fake_host.py").write_text(textwrap.dedent(FAKE_HOST), encoding="utf-8")
         (fixtures / "fake_judge.py").write_text(textwrap.dedent(FAKE_JUDGE), encoding="utf-8")
         (fixtures / "bad_judge.py").write_text(textwrap.dedent(BAD_JUDGE), encoding="utf-8")
+        (fixtures / "hanging_host.py").write_text(textwrap.dedent(HANGING_HOST), encoding="utf-8")
         (fixtures / "check_contains.py").write_text(textwrap.dedent(CHECK_CONTAINS), encoding="utf-8")
         (work / "inputs").mkdir(exist_ok=True)
         (work / "inputs" / "process-notes.md").write_text("Need a useful loop.\n", encoding="utf-8")
@@ -152,11 +194,16 @@ class Harness:
         host_invoke = [python, (fixtures / "fake_host.py").as_posix(), (work / "host-capture.txt").as_posix()]
         if host_leak:
             host_invoke.append(host_leak)
+        if host_usage:
+            host_invoke += ["--usage", str(host_usage)]
+        if hanging_host:
+            host_invoke = [python, (fixtures / "hanging_host.py").as_posix(), (work / "beats").as_posix()]
         host_invoke_tail = ", ".join(f'"{item}"' for item in host_invoke)
         if judge_script == "fake_judge":
+            usage_args = f', "--usage", "{judge_usage}"' if judge_usage else ""
             judge_invoke = (
                 f'["{python}", "{(fixtures / "fake_judge.py").as_posix()}", '
-                f'"{judge_state}", "{judge_revise_count}", "{capture}"]'
+                f'"{judge_state}", "{judge_revise_count}", "{capture}"{usage_args}]'
             )
         else:
             judge_invoke = f'["{python}", "{(fixtures / "bad_judge.py").as_posix()}"]'
@@ -220,7 +267,8 @@ class Harness:
             loop_control:
               max_iterations: 2
               budget:
-                wall_clock_min: 5
+                wall_clock_min: {wall_clock_min}
+            __BUDGET__
               human_checkpoints: []
               stop_conditions:
                 - all deliveries pass their gate clean
@@ -239,6 +287,7 @@ class Harness:
         loop_yaml = loop_yaml.replace(
             "\n__EXTRA_CONTEXT__", ("\n" + extra_context.rstrip()) if extra_context else ""
         )
+        loop_yaml = loop_yaml.replace("\n__BUDGET__", ("\n" + budget_yaml.rstrip()) if budget_yaml else "")
         loop_yaml = loop_yaml.replace("__EGRESS__", egress_yaml.strip("\n"))
         (work / "loop.yaml").write_text(loop_yaml, encoding="utf-8")
 
@@ -512,6 +561,86 @@ def scenario_revision_cap(h: Harness) -> Optional[str]:
         )
 
 
+def scenario_token_cap(h: Harness) -> Optional[str]:
+    # Host and judge both report usage in Claude's JSON envelope (600 and 100
+    # tokens per call) under a 1000-token cap: plan 600, verdict 700, host
+    # revision 1300 > cap - the runner must stop before the next model call,
+    # and must have unwrapped the envelope rather than writing it as the
+    # artifact.
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        spec = h.scaffold(
+            work, judge_revise_count=1, host_usage=600, judge_usage=100, budget_yaml="    tokens: 1000"
+        )
+        result = h.run(work, spec)
+        state = h.state(work)
+        judge_state = work / "judge-state.json"
+        calls = 0
+        if judge_state.exists():
+            calls = int(json.loads(judge_state.read_text(encoding="utf-8")).get("count", 0))
+        plan = work / "loop-workspace" / "plan.md"
+        plan_text = plan.read_text(encoding="utf-8") if plan.exists() else ""
+        return check_all(
+            expect(result.returncode != 0, "expected non-zero exit once the token cap is exceeded"),
+            expect(state.get("status") not in {"passed", "running", None}, f"state.status={state.get('status')!r} must be terminal and not passed"),
+            expect(calls == 1, f"judge called {calls} times; the run must stop before the call after the cap is crossed (want 1)"),
+            expect(not (work / "loop-workspace" / "delivery-1.md").exists(), "delivery drafted after the token cap was exceeded"),
+            expect("Owner: host" in plan_text and '"usage"' not in plan_text, "plan.md should hold the reply text, not the CLI's JSON envelope"),
+        )
+
+
+def scenario_unmetered_cap(h: Harness) -> Optional[str]:
+    # A token cap with a host that reports no usage cannot be enforced, and
+    # an unenforceable cap must not run: the runner may refuse up front or
+    # stop after the first call, but the judge is never reached and the run
+    # never passes.
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        spec = h.scaffold(work, judge_revise_count=0, judge_usage=100, budget_yaml="    tokens: 1000000")
+        result = h.run(work, spec)
+        state = h.state(work)
+        judge_state = work / "judge-state.json"
+        calls = 0
+        if judge_state.exists():
+            calls = int(json.loads(judge_state.read_text(encoding="utf-8")).get("count", 0))
+        return check_all(
+            expect(result.returncode != 0, "expected non-zero exit when a set token cap cannot count the host's calls"),
+            expect(state.get("status") not in {"passed", "running"}, f"state.status={state.get('status')!r} must be terminal and not passed"),
+            expect(calls == 0, f"judge called {calls} times; the run must stop at or before the first unmetered call"),
+        )
+
+
+def scenario_timeout_tree_kill(h: Harness) -> Optional[str]:
+    # The host hangs with a tool running in its own session. When the
+    # 3-second wall-clock budget runs out the runner must stop the call and
+    # take the tool down with it - an orphaned tool keeps working outside
+    # every budget.
+    import time
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        spec = h.scaffold(work, hanging_host=True, wall_clock_min="0.05")
+        started = time.monotonic()
+        result = h.run(work, spec)
+        elapsed = time.monotonic() - started
+        state = h.state(work)
+        beats = work / "beats"
+
+        def sizes() -> dict:
+            return {f.name: f.stat().st_size for f in beats.iterdir()} if beats.exists() else {}
+
+        before = sizes()
+        time.sleep(0.8)
+        live = [name for name, size in sizes().items() if size > before.get(name, 0)]
+        return check_all(
+            expect(result.returncode != 0, "expected non-zero exit when the wall-clock budget runs out mid-call"),
+            expect(elapsed < 25, f"run took {elapsed:.0f}s; the hanging call must be cut off at the 3s budget, not at its 30s timeout"),
+            expect(state.get("status") not in {"passed", "running", None}, f"state.status={state.get('status')!r} must be terminal and not passed"),
+            expect(bool(before), "the host's tool process never started"),
+            expect(not live, f"tool process(es) {live} still running after the call was abandoned"),
+        )
+
+
 SCENARIOS = [
     Scenario("happy-path", "gates pass after one revision; artifacts, state, log exist", scenario_happy_path),
     Scenario("judge-degrade", "unparseable judge output degrades to revise and fails at cap", scenario_judge_degrade),
@@ -523,6 +652,9 @@ SCENARIOS = [
     Scenario("cmd-output-scrub", "cmd context-source output is scrubbed of flagged content", scenario_cmd_output_scrub),
     Scenario("workspace-escape", "workspace.dir outside the loop directory is refused", scenario_workspace_escape),
     Scenario("revision-cap", "max_revisions bounds the gate and ends the run failed", scenario_revision_cap),
+    Scenario("token-cap", "reported token usage is counted and a token cap stops the run", scenario_token_cap),
+    Scenario("unmetered-cap", "a set cap that cannot count some member's calls fails closed", scenario_unmetered_cap),
+    Scenario("timeout-tree-kill", "a call cut off by the wall-clock budget takes its detached tools down too", scenario_timeout_tree_kill),
 ]
 
 

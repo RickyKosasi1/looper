@@ -87,7 +87,7 @@ goal:
 host:
   cli: codex
   model: gpt-5.5-xhigh
-  invoke: ["codex", "exec", "--model", "gpt-5.5-xhigh"]   # argv array
+  invoke: ["codex", "exec", "--json", "--model", "gpt-5.5-xhigh"]   # argv array
   timeout_sec: 600
 
 council:
@@ -95,7 +95,7 @@ council:
     role: judge                  # reviewer (notes only) | judge (verdict)
     cli: claude
     model: opus-4.8-high
-    invoke: ["claude", "-p"]
+    invoke: ["claude", "-p", "--output-format", "json"]
     timeout_sec: 600
     scope: [plan, delivery]
 
@@ -117,7 +117,7 @@ gates:
 
 loop_control:
   max_iterations: 12
-  budget: { usd: 5.00, tokens: 2_000_000, wall_clock_min: 30 }
+  budget: { tokens: 2_000_000, wall_clock_min: 30 }   # usd needs Claude-only members: Codex reports no cost
   no_progress:
     max_stalled_iterations: 2
     signals:
@@ -207,8 +207,8 @@ On install / first run, `detect-models` probes `PATH` and known locations for a 
 
 ```json
 {
-  "claude":  { "invoke": ["claude", "-p"], "authed": true },
-  "codex":   { "invoke": ["codex", "exec"], "authed": true }
+  "claude":  { "invoke": ["claude", "-p", "--output-format", "json"], "authed": true },
+  "codex":   { "invoke": ["codex", "exec", "--json"], "authed": true }
 }
 ```
 
@@ -244,7 +244,7 @@ This path is easy and conversational, but caps are enforced by the current agent
 3. Host drafts `plan.md`.
 4. **plan_gate:** run `programmatic` checks; invoke the `verdict_source` member (argv + timeout) for `judge` criteria; parse the structured verdict. On `revise`, write `review-N.md`, host revises, repeat up to `max_revisions`. Honor `human_checkpoints`.
 5. On clean, iterate deliveries: host writes `delivery-N.md`; **delivery_gate** runs the same way.
-6. Enforce `loop_control` on every cycle. The runner enforces `max_iterations`, `no_progress`, and `budget.wall_clock_min`; `budget.usd` and `budget.tokens` are rendered into prompts/logs as advisory operator limits unless a wrapper adds provider-specific accounting.
+6. Enforce `loop_control` on every cycle. The runner enforces `max_iterations`, `no_progress`, `budget.wall_clock_min`, and `budget.tokens` / `budget.usd` from the usage each model call reports (Claude `--output-format json` result: tokens + `total_cost_usd`; Codex `exec --json` `turn.completed`: tokens). Usage accrues in state across resumes. The remaining budget is handed down to each call where the CLI can enforce it: the subprocess timeout is capped at the remaining wall clock, and Claude gets the remaining USD as `--max-budget-usd` (checked between its API turns). Caps fail closed: a set cap that some member's invoke cannot report is refused before the first call, and a call that comes back without the capped measure ends the run.
 7. Append a compact run log after each context, model, check, gate, and revision step.
 8. Stop on any `stop_condition`; write final output.
 

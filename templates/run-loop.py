@@ -11,11 +11,14 @@ import argparse
 import datetime as _dt
 import fnmatch
 import json
+import math
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 
@@ -30,6 +33,15 @@ SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv"}
 
 class RunnerError(RuntimeError):
     pass
+
+
+class ModelError(RunnerError):
+    """A failed model call; carries whatever usage the CLI reported anyway."""
+
+    def __init__(self, message: str, usage: dict[str, Any] | None = None, kind: str = "") -> None:
+        super().__init__(message)
+        self.usage = usage
+        self.kind = kind
 
 
 def ask(prompt: str) -> str:
@@ -114,41 +126,463 @@ def is_redacted(path: Path, base_dir: Path, globs: list[str]) -> bool:
     return False
 
 
+def _windows_kill_on_close_job(proc: subprocess.Popen) -> Any:
+    """Put a process in a Job Object that kills every member when closed.
+
+    Children inherit the job, so terminating it takes down the whole tree -
+    the Windows stand-in for a POSIX process group. None if unavailable.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_ulonglong) for name in (
+                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+            )]
+
+        class BasicLimits(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class ExtendedLimits(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", BasicLimits),
+                ("IoInfo", IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        limits = ExtendedLimits()
+        limits.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        extended_limit_information = 9
+        if not kernel32.SetInformationJobObject(job, extended_limit_information, ctypes.byref(limits), ctypes.sizeof(limits)) \
+                or not kernel32.AssignProcessToJobObject(job, int(proc._handle)):
+            kernel32.CloseHandle(job)
+            return None
+        return (kernel32, job)
+    except Exception:
+        return None
+
+
+_SUBREAPER: bool | None = None
+
+
+def _become_subreaper() -> bool:
+    """Linux: adopt orphaned descendants instead of letting init take them.
+
+    A tool process whose parent CLI already exited is otherwise untraceable
+    by parentage; as a subreaper the runner stays its ancestor.
+    """
+    global _SUBREAPER
+    if _SUBREAPER is None:
+        _SUBREAPER = False
+        if sys.platform.startswith("linux"):
+            try:
+                import ctypes
+
+                libc = ctypes.CDLL(None, use_errno=True)
+                _SUBREAPER = libc.prctl(36, 1, 0, 0, 0) == 0  # PR_SET_CHILD_SUBREAPER
+            except Exception:
+                pass
+    return _SUBREAPER
+
+
+def _children_by_parent() -> dict[int, list[int]]:
+    table: dict[int, list[int]] = {}
+    proc_dir = Path("/proc")
+    if proc_dir.is_dir():
+        for entry in proc_dir.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                stat = (entry / "stat").read_text()
+            except OSError:
+                continue
+            # comm may contain spaces and parens; ppid follows the last ')'.
+            fields = stat[stat.rfind(")") + 2:].split()
+            if len(fields) > 1 and fields[1].isdigit():
+                table.setdefault(int(fields[1]), []).append(int(entry.name))
+        return table
+    try:
+        listing = subprocess.run(
+            ["ps", "-A", "-o", "pid=,ppid="], stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, timeout=10, check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return table
+    for line in listing.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            table.setdefault(int(parts[1]), []).append(int(parts[0]))
+    return table
+
+
+def _descendants(roots: list[int]) -> set[int]:
+    table = _children_by_parent()
+    found: set[int] = set()
+    stack = list(roots)
+    while stack:
+        for child in table.get(stack.pop(), []):
+            if child not in found:
+                found.add(child)
+                stack.append(child)
+    return found
+
+
+class ProcessTree:
+    """A subprocess plus everything it spawns, killable as one unit.
+
+    Model CLIs run tools in child processes - Claude Code starts each Bash
+    tool in its own session, out of reach of a process-group kill - and
+    killing only the CLI orphans them to keep working outside any budget.
+    POSIX follows parentage (on Linux the runner is a subreaper, so tools
+    orphaned by an exited CLI stay traceable); Windows uses a Job Object.
+    """
+
+    def __init__(self, proc: subprocess.Popen) -> None:
+        self.proc = proc
+        self.job = _windows_kill_on_close_job(proc) if os.name == "nt" else None
+
+    @staticmethod
+    def spawn_kwargs() -> dict[str, Any]:
+        if os.name == "nt":
+            return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        return {"start_new_session": True}  # own process group, pgid == pid
+
+    def kill(self) -> None:
+        if os.name != "nt":
+            self._kill_posix()
+        elif self.job is not None:
+            kernel32, job = self.job
+            self.job = None
+            kernel32.CloseHandle(job)  # kill-on-close takes the whole job down
+        elif self.proc.poll() is None:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(self.proc.pid)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+            )
+        else:
+            return
+        try:
+            self.proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+
+    def _kill_posix(self) -> None:
+        # Calls run one at a time, so every descendant of a subreaper runner
+        # belongs to this call. Repeat until nothing is left, in case a
+        # process forked between the listing and the kill.
+        roots = [self.proc.pid] + ([os.getpid()] if _SUBREAPER else [])
+        for _ in range(5):
+            victims = _descendants(roots)
+            if self.proc.poll() is None:
+                victims.add(self.proc.pid)
+            victims.discard(os.getpid())
+            try:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            live = False
+            for pid in victims:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    live = True
+                except (ProcessLookupError, PermissionError):
+                    pass
+            self._reap(victims - {self.proc.pid})
+            if not live:
+                return
+
+    @staticmethod
+    def _reap(pids: set[int]) -> None:
+        """Collect killed processes the runner adopted, so none stay zombies."""
+        deadline = time.monotonic() + 2
+        pending = set(pids)
+        while pending and time.monotonic() < deadline:
+            for pid in list(pending):
+                try:
+                    done, _ = os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:  # not ours: init reaps it
+                    done = pid
+                if done:
+                    pending.discard(pid)
+            if pending:
+                time.sleep(0.02)
+
+
+def _drain(stream: Any, sink: list[bytes]) -> None:
+    try:
+        while True:
+            chunk = stream.read1(65536)
+            if not chunk:
+                return
+            sink.append(chunk)
+    except (OSError, ValueError):
+        return
+
+
+def _feed(stream: Any, data: bytes) -> None:
+    try:
+        stream.write(data)
+        stream.close()
+    except (OSError, ValueError):
+        return
+
+
 def run_argv(
     argv: list[str],
     *,
     cwd: Path,
-    timeout_sec: int,
+    timeout_sec: float,
     stdin: str = "",
 ) -> subprocess.CompletedProcess[str]:
+    """Run argv, then kill everything it spawned.
+
+    The tree is killed as soon as the main process exits or times out: a
+    leftover tool process is not the loop's to keep, and one still holding
+    stdout would otherwise stall the read until the timeout - turning a
+    finished call into a timed-out one. Exit code 124 means timed out.
+    """
+    if os.name != "nt":
+        _become_subreaper()
     try:
-        return subprocess.run(
+        proc = subprocess.Popen(
             argv,
-            input=stdin,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            encoding="utf-8",
-            errors="replace",
             cwd=str(cwd),
-            timeout=timeout_sec,
-            check=False,
+            **ProcessTree.spawn_kwargs(),
         )
-    except subprocess.TimeoutExpired as exc:
-        completed = subprocess.CompletedProcess(argv, 124, exc.stdout or "", exc.stderr or "")
-        return completed
     except OSError as exc:
         return subprocess.CompletedProcess(argv, 127, "", str(exc))
+    tree = ProcessTree(proc)
+    out: list[bytes] = []
+    err: list[bytes] = []
+    readers = [
+        threading.Thread(target=_drain, args=(proc.stdout, out), daemon=True),
+        threading.Thread(target=_drain, args=(proc.stderr, err), daemon=True),
+    ]
+    for thread in readers + [threading.Thread(target=_feed, args=(proc.stdin, stdin.encode("utf-8")), daemon=True)]:
+        thread.start()
+    try:
+        returncode = proc.wait(timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        returncode = 124
+    finally:
+        # Also on Ctrl+C: the child runs in its own session, so the terminal's
+        # SIGINT no longer reaches it - without this it would keep spending.
+        tree.kill()
+    for thread in readers:
+        # A descendant that escaped the tree (setsid, job breakaway) can hold
+        # a pipe open forever; keep what arrived rather than hang.
+        thread.join(timeout=2)
+    return subprocess.CompletedProcess(
+        argv,
+        returncode,
+        b"".join(out).decode("utf-8", errors="replace"),
+        b"".join(err).decode("utf-8", errors="replace"),
+    )
 
 
-def call_model(member: dict[str, Any], prompt: str, base_dir: Path) -> str:
-    argv = ensure_argv(member.get("invoke"), f"{member.get('id', member.get('cli', 'model'))}.invoke")
-    timeout_sec = int(member.get("timeout_sec", 600))
+def _json_events(text: str) -> list[dict[str, Any]]:
+    """Parse stdout as one JSON object or as JSONL; non-JSON lines are skipped."""
+    stripped = text.strip()
+    if not stripped.startswith("{"):
+        return []
+    try:
+        whole = json.loads(stripped)
+    except json.JSONDecodeError:
+        whole = None
+    if isinstance(whole, dict):
+        return [whole]
+    events: list[dict[str, Any]] = []
+    for line in stripped.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def _int(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def parse_model_output(stdout: str, stderr: str) -> tuple[str, dict[str, Any] | None]:
+    """Split CLI output into response text and the usage it reports.
+
+    Recognized formats: Claude `-p --output-format json` / `stream-json`
+    (a `result` event carrying `usage` and `total_cost_usd`), Codex
+    `exec --json` (`turn.completed` events carrying token `usage`; no cost),
+    and plain `codex exec` (a `tokens used` total on stderr). Anything else
+    is returned verbatim with usage None - the call is unmetered.
+    """
+    events = _json_events(stdout)
+
+    results = [e for e in events if e.get("type") == "result" and ("usage" in e or "total_cost_usd" in e)]
+    if results:
+        final = results[-1]
+        text = final.get("result")
+        usage = final.get("usage") if isinstance(final.get("usage"), dict) else {}
+        # Anthropic reports cache reads/writes outside input_tokens.
+        cache = _int(usage.get("cache_creation_input_tokens")) + _int(usage.get("cache_read_input_tokens"))
+        input_tokens = _int(usage.get("input_tokens"))
+        output_tokens = _int(usage.get("output_tokens"))
+        # modelUsage totals every model the session used, and stays filled in
+        # on error results, where `usage` comes back zeroed.
+        per_model = [u for u in (final.get("modelUsage") or {}).values() if isinstance(u, dict)]
+        if per_model:
+            cache = sum(_int(u.get("cacheCreationInputTokens")) + _int(u.get("cacheReadInputTokens")) for u in per_model)
+            input_tokens = sum(_int(u.get("inputTokens")) for u in per_model)
+            output_tokens = sum(_int(u.get("outputTokens")) for u in per_model)
+        cost = final.get("total_cost_usd")
+        reported = {
+            "tokens": input_tokens + cache + output_tokens,
+            "input_tokens": input_tokens,
+            "cache_tokens": cache,
+            "output_tokens": output_tokens,
+            "usd": float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None,
+        }
+        # An error result (e.g. error_max_budget_usd) still spent money.
+        if final.get("is_error") or not isinstance(text, str):
+            kind = str(final.get("subtype") or "error")
+            raise ModelError(f"Model reported an error: {text or kind}", reported, kind)
+        return text.strip(), reported
+
+    turns = [e for e in events if e.get("type") in {"turn.completed", "turn.failed"}]
+    if turns:
+        failed = [e for e in turns if e.get("type") == "turn.failed"]
+        messages = [
+            e["item"].get("text", "")
+            for e in events
+            if e.get("type") == "item.completed"
+            and isinstance(e.get("item"), dict)
+            and e["item"].get("type") == "agent_message"
+        ]
+        # OpenAI counts cached input inside input_tokens and reasoning
+        # inside output_tokens, so the two fields are the whole total.
+        input_tokens = sum(_int((e.get("usage") or {}).get("input_tokens")) for e in turns)
+        output_tokens = sum(_int((e.get("usage") or {}).get("output_tokens")) for e in turns)
+        # A failed turn reports no usage of its own: only completed turns
+        # are known spend.
+        reported = None
+        if any(e.get("type") == "turn.completed" for e in turns):
+            reported = {
+                "tokens": input_tokens + output_tokens,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "usd": None,
+            }
+        if failed:
+            error = failed[-1].get("error") or {}
+            raise ModelError(f"Model reported an error: {error.get('message', 'turn failed')}", reported, "turn_failed")
+        return (messages[-1] if messages else "").strip(), reported
+
+    totals = re.findall(r"tokens used\s*:?\s*([\d,]+)", stderr, re.IGNORECASE)
+    if totals:
+        return stdout.strip(), {"tokens": int(totals[-1].replace(",", "")), "usd": None}
+    return stdout.strip(), None
+
+
+def invoke_meters(member: dict[str, Any], key: str) -> bool | None:
+    """Whether a member's invoke reports `key` ("tokens" or "usd").
+
+    True/False for CLIs whose output parse_model_output knows; None when the
+    argv alone cannot tell (a wrapper script may well emit Claude JSON).
+    Local members cost nothing, so USD is always counted for them.
+    """
+    if key == "usd" and member.get("local"):
+        return True
+    argv = member.get("invoke", []) or []
+    exe = Path(argv[0]).stem.lower() if argv else ""
+    if exe == "claude":
+        fmt = ""
+        for index, arg in enumerate(argv):
+            if arg == "--output-format" and index + 1 < len(argv):
+                fmt = argv[index + 1]
+            elif arg.startswith("--output-format="):
+                fmt = arg.split("=", 1)[1]
+        return fmt in {"json", "stream-json"}
+    if exe == "codex":
+        return key == "tokens" and "exec" in argv
+    if exe in {"gemini", "llm", "ollama"}:
+        return False
+    return None
+
+
+def with_usd_ceiling(argv: list[str], remaining_usd: float) -> list[str]:
+    """Hand the remaining USD budget to Claude as --max-budget-usd.
+
+    Claude checks it between API turns, so a long agentic call stops itself
+    near the cap instead of finishing. An existing flag keeps the lower value.
+    """
+    # Round down: never grant a call more than is actually left.
+    ceiling = math.floor(max(remaining_usd, 0.0) * 1_000_000) / 1_000_000
+    out = list(argv)
+    for index, arg in enumerate(out):
+        if arg == "--max-budget-usd" and index + 1 < len(out):
+            try:
+                ceiling = min(ceiling, float(out[index + 1]))
+            except ValueError:
+                pass
+            out[index + 1] = f"{ceiling:.6f}"
+            return out
+        if arg.startswith("--max-budget-usd="):
+            try:
+                ceiling = min(ceiling, float(arg.split("=", 1)[1]))
+            except ValueError:
+                pass
+            out[index] = f"--max-budget-usd={ceiling:.6f}"
+            return out
+    return out + ["--max-budget-usd", f"{ceiling:.6f}"]
+
+
+def call_model(
+    member: dict[str, Any],
+    prompt: str,
+    base_dir: Path,
+    *,
+    argv: list[str] | None = None,
+    timeout_sec: float | None = None,
+) -> tuple[str, dict[str, Any] | None]:
+    argv = argv or ensure_argv(member.get("invoke"), f"{member.get('id', member.get('cli', 'model'))}.invoke")
+    if timeout_sec is None:
+        timeout_sec = int(member.get("timeout_sec", 600))
     result = run_argv(argv, cwd=base_dir, timeout_sec=timeout_sec, stdin=prompt)
+    # Parse even a failed call: its reported usage is real spend.
+    text, usage = parse_model_output(result.stdout, result.stderr)
     if result.returncode != 0:
-        raise RunnerError(
-            f"Model invocation failed ({' '.join(argv)}): exit {result.returncode}\n{result.stderr}"
+        raise ModelError(
+            f"Model invocation failed ({' '.join(argv)}): exit {result.returncode}\n{result.stderr}",
+            usage,
+            "timeout" if result.returncode == 124 else "exit",
         )
-    return result.stdout.strip()
+    return text, usage
 
 
 def _judge_candidates(text: str) -> list[str]:
@@ -250,15 +684,168 @@ class Runner:
         with self.run_log_path.open("a", encoding="utf-8") as fh:
             fh.write(f"- {utc_now()} `{event}`{payload}\n")
 
-    def enforce_wall_clock(self) -> None:
-        budget = self.spec.get("loop_control", {}).get("budget", {})
-        wall_clock_min = budget.get("wall_clock_min")
+    def budget(self) -> dict[str, Any]:
+        return self.spec.get("loop_control", {}).get("budget", {}) or {}
+
+    def remaining_wall_clock_sec(self) -> float | None:
+        wall_clock_min = self.budget().get("wall_clock_min")
         if wall_clock_min is None:
-            return
-        if self.elapsed_sec() > float(wall_clock_min) * 60:
-            self.save_state(status="failed", failure="wall_clock_budget_exceeded")
-            self.append_log("stop", reason="wall_clock_budget_exceeded")
-            raise RunnerError("Wall-clock budget exceeded")
+            return None
+        return float(wall_clock_min) * 60 - self.elapsed_sec()
+
+    def remaining_usd(self) -> float | None:
+        cap = self.budget().get("usd")
+        if cap is None:
+            return None
+        return float(cap) - float((self.state.get("usage", {}) or {}).get("usd", 0) or 0)
+
+    def budget_stop(self, reason: str, message: str, **fields: Any) -> None:
+        self.save_state(status="failed", failure=reason)
+        self.append_log("stop", reason=reason, **fields)
+        raise RunnerError(message)
+
+    def enforce_budget(self) -> None:
+        # Usage accrues across resumes. Token/USD caps stop once reached:
+        # with nothing left there is no budget to hand the next call.
+        budget = self.budget()
+        used = self.state.get("usage", {}) or {}
+        remaining_sec = self.remaining_wall_clock_sec()
+        if remaining_sec is not None and remaining_sec < 0:
+            self.budget_stop(
+                "wall_clock_budget_exceeded",
+                "Wall-clock budget exceeded",
+                used=round(self.elapsed_sec(), 1),
+                cap=float(budget["wall_clock_min"]) * 60,
+            )
+        tokens = int(used.get("tokens", 0) or 0)
+        if budget.get("tokens") is not None and tokens >= budget["tokens"]:
+            self.budget_stop(
+                "token_budget_exceeded",
+                f"Token budget exceeded: {tokens} of {budget['tokens']} tokens used",
+                used=tokens,
+                cap=budget["tokens"],
+            )
+        usd = round(float(used.get("usd", 0) or 0), 6)
+        if budget.get("usd") is not None and usd >= float(budget["usd"]):
+            self.budget_stop(
+                "usd_budget_exceeded",
+                f"USD budget exceeded: ${usd:.4f} of ${budget['usd']} spent",
+                used=usd,
+                cap=float(budget["usd"]),
+            )
+
+    def record_usage(self, who: str, member: dict[str, Any], usage: dict[str, Any] | None) -> None:
+        totals = dict(self.state.get("usage", {}) or {})
+        by_member = dict(totals.get("by_member", {}) or {})
+        mine = dict(by_member.get(who, {}) or {})
+        totals["calls"] = int(totals.get("calls", 0) or 0) + 1
+        mine["calls"] = int(mine.get("calls", 0) or 0) + 1
+        tokens = (usage or {}).get("tokens")
+        usd = (usage or {}).get("usd")
+        if usd is None and member.get("local"):
+            usd = 0.0
+        unmetered = []
+        for key, value in (("tokens", tokens), ("usd", usd)):
+            if value is None:
+                untracked = dict(totals.get("untracked_calls", {}) or {})
+                untracked[key] = int(untracked.get(key, 0) or 0) + 1
+                totals["untracked_calls"] = untracked
+                unmetered.append(key)
+                continue
+            if key == "usd":
+                totals[key] = round(float(totals.get(key, 0) or 0) + value, 6)
+                mine[key] = round(float(mine.get(key, 0) or 0) + value, 6)
+            else:
+                totals[key] = int(totals.get(key, 0) or 0) + value
+                mine[key] = int(mine.get(key, 0) or 0) + value
+        by_member[who] = mine
+        totals["by_member"] = by_member
+        self.save_state(usage=totals)
+        if usage is not None:
+            self.append_log("model_usage", member=who, tokens=tokens, usd=usd)
+        # Fail closed: a cap that cannot count this call is not enforceable,
+        # and an unenforceable cap is worse than none.
+        for key in unmetered:
+            if self.budget().get(key) is not None:
+                self.refuse_unenforceable_budget(who, member, key, status="failed")
+
+    def refuse_unenforceable_budget(self, who: str, member: dict[str, Any], key: str, *, status: str) -> None:
+        argv = " ".join(member.get("invoke", []) or [])
+        fix = (
+            "invoke Claude as `claude -p --output-format json` or Codex as `codex exec --json`"
+            if key == "tokens"
+            else "only `claude -p --output-format json` reports cost - switch the member or drop budget.usd"
+        )
+        reason = f"budget_unenforceable:{key}:{who}"
+        self.save_state(status=status, failure=reason)
+        self.append_log("stop", reason=reason, invoke=argv)
+        raise RunnerError(f"budget.{key} cannot be enforced: {who} ({argv}) reports no {key}; {fix}")
+
+    def invoked_members(self) -> list[tuple[str, dict[str, Any]]]:
+        """Every model this run can call: the host, reviewers, verdict sources."""
+        members: list[tuple[str, dict[str, Any]]] = [("host", spec_get(self.spec, "host"))]
+        seen: set[str] = set()
+        for gate in (self.spec.get("gates") or {}).values():
+            ids = [mid for mid in gate.get("members", []) or [] if self.member(mid).get("role") == "reviewer"]
+            source = gate.get("verdict_source")
+            if gate.get("verdict_policy") == "revise_until_clean" and source and source != "human":
+                ids.append(source)
+            for mid in ids:
+                if mid not in seen:
+                    seen.add(mid)
+                    members.append((mid, self.member(mid)))
+        return members
+
+    def preflight_budget(self) -> None:
+        # Refuse before spending anything when a set cap provably cannot count
+        # some member; argv the runner cannot judge is caught on its first call.
+        for key in ("tokens", "usd"):
+            if self.budget().get(key) is None:
+                continue
+            for who, member in self.invoked_members():
+                if invoke_meters(member, key) is False:
+                    self.refuse_unenforceable_budget(who, member, key, status="blocked")
+
+    def invoke_member(self, who: str, member: dict[str, Any], prompt: str) -> str:
+        # Hand what is left of the budget down to the call itself where the
+        # CLI can enforce it: the remaining wall clock caps the subprocess
+        # timeout, and Claude gets the remaining USD as --max-budget-usd. Token
+        # caps have no per-call lever, so a call can still cross one; the
+        # check before the next call then stops the run.
+        self.enforce_budget()
+        argv = ensure_argv(member.get("invoke"), f"{who}.invoke")
+        timeout_sec: float = int(member.get("timeout_sec", 600))
+        remaining_sec = self.remaining_wall_clock_sec()
+        clamped = remaining_sec is not None and remaining_sec < timeout_sec
+        if clamped:
+            timeout_sec = max(remaining_sec, 0.0)
+        remaining_usd = self.remaining_usd()
+        if remaining_usd is not None and not member.get("local") and Path(argv[0]).stem.lower() == "claude":
+            argv = with_usd_ceiling(argv, remaining_usd)
+        try:
+            text, usage = call_model(member, prompt, self.base_dir, argv=argv, timeout_sec=timeout_sec)
+        except ModelError as exc:
+            if exc.kind == "timeout" and clamped:
+                self.budget_stop(
+                    "wall_clock_budget_exceeded",
+                    f"Wall-clock budget exceeded: {who} was stopped when the budget ran out",
+                    member=who,
+                )
+            if exc.usage is not None:
+                self.record_usage(who, member, exc.usage)
+            if exc.kind == "error_max_budget_usd":
+                spent = round(float((self.state.get("usage", {}) or {}).get("usd", 0) or 0), 6)
+                self.budget_stop(
+                    "usd_budget_exceeded",
+                    f"USD budget exceeded: {who} stopped at its --max-budget-usd ceiling "
+                    f"(${spent:.4f} of ${self.budget().get('usd')} spent)",
+                    member=who,
+                    used=spent,
+                    cap=self.budget().get("usd"),
+                )
+            raise
+        self.record_usage(who, member, usage)
+        return text
 
     def no_progress_reached(self, gate_name: str, failures: list[str]) -> bool:
         if not failures:
@@ -456,7 +1043,7 @@ class Runner:
         redaction_globs = self.all_redaction_globs()
         chunks: list[str] = []
         for index, source in enumerate(goal.get("context_sources", []) or [], start=1):
-            self.enforce_wall_clock()
+            self.enforce_budget()
             if "file" in source:
                 try:
                     path = relative_to_base(source["file"], self.base_dir)
@@ -520,10 +1107,10 @@ class Runner:
         # not match redaction globs.
         scrubbed, hits = self.scrub_flagged_content(prompt, self.all_redaction_globs())
         self.surface_redaction("prompt for host", hits)
-        return call_model(spec_get(self.spec, "host"), scrubbed, self.base_dir)
+        return self.invoke_member("host", spec_get(self.spec, "host"), scrubbed)
 
     def run_host(self, phase: str, target: Path, artifact: str = "", review: str = "") -> None:
-        self.enforce_wall_clock()
+        self.enforce_budget()
         self.append_log("host_start", phase=phase, target=target.name)
         output = self.call_host(self.host_prompt(phase, artifact, review))
         write_text(target, output)
@@ -594,7 +1181,7 @@ class Runner:
             self.judge_prompt(gate_name, artifact_label, artifact_text, criteria),
         )
         self.ensure_consent(member_id)
-        output = call_model(self.member(member_id), prompt, self.base_dir)
+        output = self.invoke_member(member_id, self.member(member_id), prompt)
         verdict = parse_judge_output(output)
         verdict["member"] = member_id
         self.append_log("judge_verdict", gate=gate_name, member=member_id, verdict=verdict.get("verdict"))
@@ -619,7 +1206,7 @@ class Runner:
             )
             prompt = self.redact_prompt_for_member(member_id, prompt)
             self.ensure_consent(member_id)
-            notes.append(f"## {member_id}\n\n{call_model(member, prompt, self.base_dir)}")
+            notes.append(f"## {member_id}\n\n{self.invoke_member(member_id, member, prompt)}")
             self.append_log("reviewer_notes", gate=gate_name, member=member_id)
         return notes
 
@@ -642,7 +1229,7 @@ class Runner:
         self.append_log("gate_start", gate=gate_name, artifact=artifact_label)
 
         while True:
-            self.enforce_wall_clock()
+            self.enforce_budget()
             artifact_text = artifact_path.read_text(encoding="utf-8")
             review_parts: list[str] = []
             failures: list[str] = []
@@ -739,13 +1326,15 @@ class Runner:
     def run(self) -> int:
         try:
             return self._run()
-        except Exception as exc:
-            # Any crash - not just RunnerError - must leave a terminal state:
-            # a state file claiming "running" after the process died is a
-            # phantom in-flight run for resume logic and audits.
+        except BaseException as exc:
+            # Any crash or interruption (Ctrl+C, SIGTERM) - not just
+            # RunnerError - must leave a terminal state: a state file claiming
+            # "running" after the process died is a phantom in-flight run for
+            # resume logic and audits.
+            error = str(exc) or type(exc).__name__
             if self.state.get("status") not in {"failed", "blocked"}:
-                self.save_state(status="failed", failure=str(exc))
-            self.append_log("run_error", error=str(exc))
+                self.save_state(status="failed", failure=error)
+            self.append_log("run_error", error=error)
             raise
 
     def _run(self) -> int:
@@ -756,6 +1345,9 @@ class Runner:
         # insta-trip the detector on the first new gate round.
         self.save_state(status="running", no_progress={"count": 0, "signature": "", "gate": ""})
         self.append_log("run_start", spec=str(self.spec_path))
+        self.preflight_budget()
+        # A resumed run that already spent its budget stops before any work.
+        self.enforce_budget()
         self.gather_context()
 
         plan_path = self.workspace / "plan.md"
@@ -768,7 +1360,7 @@ class Runner:
         max_iterations = int(spec_get(self.spec, "loop_control", "max_iterations"))
         start_iteration = max(1, int(self.state.get("iteration", 0) or 0))
         for iteration in range(start_iteration, max_iterations + 1):
-            self.enforce_wall_clock()
+            self.enforce_budget()
             self.save_state(status="delivery", iteration=iteration)
             delivery_path = self.workspace / f"delivery-{iteration}.md"
             if not delivery_path.exists():
@@ -798,6 +1390,10 @@ def main(argv: list[str] | None = None) -> int:
         help="Path to loop.resolved.json (defaults to the file next to run-loop.py).",
     )
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    if os.name != "nt":
+        # Turn SIGTERM into SystemExit so cleanup runs: run_argv kills the
+        # model's process tree on the way out instead of orphaning it.
+        signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
     try:
         return Runner(args.spec_path).run()
     except RunnerError as exc:

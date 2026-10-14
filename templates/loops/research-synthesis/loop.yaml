@@ -52,7 +52,7 @@ goal:
 host:
   cli: claude
   model: default
-  invoke: ["claude", "-p"]
+  invoke: ["claude", "-p", "--output-format", "json"]
   timeout_sec: 900
 
 council:
@@ -61,7 +61,7 @@ council:
     role: judge
     cli: claude
     model: default
-    invoke: ["claude", "-p"]
+    invoke: ["claude", "-p", "--output-format", "json"]
     timeout_sec: 600
     scope: [plan, delivery]
     local: false

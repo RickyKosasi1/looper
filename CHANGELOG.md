@@ -4,6 +4,69 @@ All notable changes to Looper are documented here. Versions follow
 [Semantic Versioning](https://semver.org/); the loop spec format is versioned
 separately via `version:` in `loop.yaml` (currently `1`).
 
+## Unreleased
+
+### Changed — token and USD budgets are enforced
+- `run-loop.py` now reads the usage each model call reports and stops the run
+  (`failed`, `token_budget_exceeded` / `usd_budget_exceeded`, exit 2) once
+  `loop_control.budget.tokens` or `.usd` is exceeded. It checks before every
+  model call. Recognized
+  formats: `claude -p --output-format json` / `stream-json` (tokens + cost)
+  and `codex exec --json` or plain `codex exec` (tokens only). The reply text
+  is unwrapped from the JSON envelope before it becomes an artifact.
+- Each call is handed what is left of the budget, so a single long call
+  cannot run far past a cap: its subprocess timeout is capped at the
+  remaining wall clock (a call killed this way ends the run with
+  `wall_clock_budget_exceeded`), and non-local Claude calls get
+  `--max-budget-usd <remaining USD>`, rounded down; an existing, lower flag in
+  the invoke is kept. Claude checks that ceiling between API turns, and its
+  `error_max_budget_usd` stop ends the run with `usd_budget_exceeded`. Token
+  caps and Codex have no per-call lever and are still checked between calls.
+- Every subprocess the runner starts (model calls, programmatic checks,
+  `cmd` context sources) is killed together with everything it spawned when
+  it exits or times out. Previously a timeout killed only the CLI: tools it
+  had started - Claude Code runs each Bash tool in its own session - kept
+  running as orphans, outside every budget (reproduced with the real
+  `claude`), and a leftover child holding stdout made a call that had
+  already finished wait out its whole timeout and fail as exit 124. POSIX
+  follows parentage, with the runner as a Linux child subreaper so tools a
+  finished CLI left behind stay traceable; Windows uses a kill-on-close Job
+  Object. Background processes a check or model starts no longer outlive
+  it. Limits: on macOS (no subreaper) a detached tool left behind by a CLI
+  that exited cleanly is not traced, and a SIGKILL of the runner itself
+  cannot be cleaned up on POSIX.
+- SIGTERM to the runner (e.g. a cancelled CI job) now kills the current
+  call's process tree, and Ctrl+C or SIGTERM leaves the run `failed` instead
+  of claiming `running`.
+- Token and USD caps stop once *reached* (`>=`), not only once exceeded.
+- Usage reported by failed calls (non-zero exit, Claude error results, Codex
+  `turn.failed` after completed turns) is counted. Claude tokens come from
+  `modelUsage`, which covers every model the session used and stays filled
+  in on error results, where `usage` is zeroed.
+- Usage accrues in `state.json` under `usage` (totals, per member, and
+  `untracked_calls`) across resumes; a resumed run already over a cap stops
+  before any work. Each metered call is logged as `model_usage`.
+- Caps fail closed — an unenforceable cap is worse than none. When a set cap
+  provably cannot count some invoked member (plain `claude -p` under any cap;
+  Codex, or another non-Claude hosted CLI, under a USD cap) the run is refused
+  before the first call (`blocked`, `budget_unenforceable:<cap>:<member>`,
+  exit 2). A call from a CLI the runner cannot judge from its argv that comes
+  back without the capped measure ends the run `failed` with the same reason.
+  Local members count as $0; there is no local exemption for tokens.
+- `looper lint` errors `unmetered-budget` on any cap the runner would refuse,
+  and warns `unverified-budget-metering` when an invoke (e.g. a wrapper
+  script) cannot be judged from its argv.
+- Shipped templates, the example, and `detect-models` defaults now invoke
+  `claude -p --output-format json` and `codex exec --json`. Specs that pair a
+  Codex member with a USD cap (`templates/loop.yaml`, `code-review`,
+  `security-scan`, the example) drop `usd` and keep their token and
+  wall-clock caps. **Breaking:** existing `loop.yaml` files with plain
+  `claude -p`, or a Codex member and a `usd` cap, are now refused until fixed.
+- **Contract:** `RUNNER-CONTRACT.md` now requires runners to parse those
+  formats and enforce token/USD caps, failing closed (previously advisory);
+  conformance adds `token-cap`, `unmetered-cap` and `timeout-tree-kill`
+  scenarios; runners must also kill a call's whole process tree.
+
 ## 0.4.0 — 2026-07-07
 
 ### Added — `looper lint`

@@ -126,9 +126,14 @@ Before running a loop, Looper pushes you to make these explicit:
   whether work is good enough.
 - **State**: where the loop records status, decisions, blockers, and outputs.
 - **Stop conditions**: success, max iterations, revision caps, no-progress
-  signals, and budget caps. The external runner enforces wall-clock caps;
-  token/USD caps are operator-visible advisory limits unless you add accounting
-  around the configured CLIs.
+  signals, and budget caps. The external runner enforces wall-clock caps, and
+  enforces token/USD caps from the usage the CLIs report: `claude -p
+  --output-format json` reports tokens and cost, `codex exec --json` reports
+  tokens only. Each call also gets what is left of the budget: its timeout
+  is capped at the remaining wall clock, and Claude is passed the remaining
+  USD as `--max-budget-usd`, so a long call stops itself. Caps fail closed: if a set cap cannot count some member's calls
+  (plain `claude -p`, or Codex under a USD cap) the runner refuses to run, and
+  `looper lint` reports it as an error.
 - **Execution boundary**: current workspace, branch/worktree, external runner,
   or a separate durable orchestrator.
 

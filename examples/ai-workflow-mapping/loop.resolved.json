@@ -1,13 +1,15 @@
 {
   "$schema": "https://github.com/ksimback/looper/schema/loop.resolved.v1.json",
-  "compiled_at": "2026-07-05T06:02:07+00:00",
+  "compiled_at": "2026-10-14T12:57:13+00:00",
   "council": [
     {
       "cli": "claude",
       "id": "reviewer-1",
       "invoke": [
         "claude",
-        "-p"
+        "-p",
+        "--output-format",
+        "json"
       ],
       "local": false,
       "model": "default",
@@ -25,7 +27,9 @@
       "id": "reviewer-1",
       "invoke": [
         "claude",
-        "-p"
+        "-p",
+        "--output-format",
+        "json"
       ],
       "local": false,
       "model": "default",
@@ -122,6 +126,7 @@
     "invoke": [
       "codex",
       "exec",
+      "--json",
       "--model",
       "gpt-5"
     ],
@@ -131,7 +136,6 @@
   "loop_control": {
     "budget": {
       "tokens": 2000000,
-      "usd": 5.0,
       "wall_clock_min": 30
     },
     "human_checkpoints": [],
@@ -181,7 +185,7 @@
       }
     ]
   },
-  "source": "C:\\Users\\kevin\\looper\\examples\\ai-workflow-mapping\\loop.yaml",
+  "source": "/home/pc/looper/examples/ai-workflow-mapping/loop.yaml",
   "version": 1,
   "workspace": {
     "dir": "./loop-workspace",

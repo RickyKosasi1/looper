@@ -31,7 +31,7 @@ goal:
 host:
   cli: codex
   model: gpt-5
-  invoke: ["codex", "exec", "--model", "gpt-5"]
+  invoke: ["codex", "exec", "--json", "--model", "gpt-5"]
   timeout_sec: 600
 
 council:
@@ -39,7 +39,7 @@ council:
     role: judge
     cli: claude
     model: default
-    invoke: ["claude", "-p"]
+    invoke: ["claude", "-p", "--output-format", "json"]
     timeout_sec: 600
     scope: [plan, delivery]
     local: false
@@ -63,7 +63,6 @@ gates:
 loop_control:
   max_iterations: 12
   budget:
-    usd: 5.0
     tokens: 2000000
     wall_clock_min: 30
   no_progress:

@@ -76,13 +76,13 @@ def reject_secret_material(values: list[str], context: str) -> None:
 
 MODEL_PROBES: dict[str, dict[str, Any]] = {
     "claude": {
-        "invoke": ["claude", "-p"],
+        "invoke": ["claude", "-p", "--output-format", "json"],
         "probe": ["claude", "--version"],
         "local": False,
         "install": "Install and authenticate the Claude CLI.",
     },
     "codex": {
-        "invoke": ["codex", "exec"],
+        "invoke": ["codex", "exec", "--json"],
         "probe": ["codex", "--version"],
         "local": False,
         "install": "Install and authenticate the Codex CLI.",
@@ -227,6 +227,31 @@ def detect_models() -> dict[str, Any]:
             "install": meta["install"],
         }
     return registry
+
+
+def invoke_meters(member: dict[str, Any], key: str) -> bool | None:
+    """Whether a member's invoke reports `key` ("tokens" or "usd").
+
+    Kept in step with invoke_meters in templates/run-loop.py: True/False for
+    CLIs whose output the runner parses, None when argv alone cannot tell.
+    """
+    if key == "usd" and member.get("local"):
+        return True
+    argv = member.get("invoke", []) or []
+    exe = Path(argv[0]).stem.lower() if argv else ""
+    if exe == "claude":
+        fmt = ""
+        for index, arg in enumerate(argv):
+            if arg == "--output-format" and index + 1 < len(argv):
+                fmt = argv[index + 1]
+            elif arg.startswith("--output-format="):
+                fmt = arg.split("=", 1)[1]
+        return fmt in {"json", "stream-json"}
+    if exe == "codex":
+        return key == "tokens" and "exec" in argv
+    if exe in {"gemini", "llm", "ollama"}:
+        return False
+    return None
 
 
 def normalize_argv(value: Any, field: str) -> list[str]:
@@ -729,6 +754,46 @@ def lint_spec(raw_spec: dict[str, Any], resolved: dict[str, Any]) -> list[dict[s
             "loop_control.budget.wall_clock_min is null; the runner will not enforce "
             "any wall-clock cap",
         )
+
+    # Mirrors run-loop.py's preflight (invoke_meters / invoked_members): a set
+    # cap the runner provably cannot count is a refusal at run time, so it is
+    # an error here; argv the runner cannot judge fails on its first call.
+    invoked = [("host", resolved.get("host", {}))]
+    for gate_name in ("plan_gate", "delivery_gate"):
+        gate = gates.get(gate_name, {})
+        ids = [mid for mid in gate.get("members", []) or [] if members.get(mid, {}).get("role") == "reviewer"]
+        source = gate.get("verdict_source")
+        if gate.get("verdict_policy") == "revise_until_clean" and source and source != "human":
+            ids.append(source)
+        for mid in ids:
+            if mid in members and all(mid != who for who, _ in invoked):
+                invoked.append((mid, members[mid]))
+    for key in ("tokens", "usd"):
+        if budget.get(key) is None:
+            continue
+        refused = [who for who, member in invoked if invoke_meters(member, key) is False]
+        unknown = [who for who, member in invoked if invoke_meters(member, key) is None]
+        what = "token usage" if key == "tokens" else "USD cost"
+        fix = (
+            "invoke Claude as `claude -p --output-format json` or Codex as `codex exec --json`"
+            if key == "tokens"
+            else "only `claude -p --output-format json` reports cost - switch the member or drop budget.usd"
+        )
+        if refused:
+            add(
+                "unmetered-budget",
+                LINT_ERROR,
+                f"loop_control.budget.{key} cannot be enforced for {', '.join(refused)}: their "
+                f"invoke reports no {what}, so the runner refuses to start ({fix})",
+            )
+        if unknown:
+            add(
+                "unverified-budget-metering",
+                LINT_WARNING,
+                f"loop_control.budget.{key}: cannot tell from the invoke whether "
+                f"{', '.join(unknown)} report {what}; the runner stops the run on the "
+                "first call that reports none",
+            )
 
     if not (control.get("stop_conditions") or []):
         add(
