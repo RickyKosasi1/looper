@@ -17,7 +17,7 @@ Registry entries should look like:
 {
   "claude": {
     "cli": "claude",
-    "invoke": ["claude", "-p"],
+    "invoke": ["claude", "-p", "--output-format", "json"],
     "available": true,
     "authed": true,
     "local": false

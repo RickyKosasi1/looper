@@ -27,7 +27,7 @@ A LOOP.md-style workflow map exists, every step has an owner, input, output, and
 ## Loop Control
 
 - Max iterations: 12
-- Budget: `{"tokens": 2000000, "usd": 5.0, "wall_clock_min": 30}`
+- Budget: `{"tokens": 2000000, "wall_clock_min": 30}`
 - No-progress: `{"action": "stop", "max_stalled_iterations": 2, "signals": ["same blocking issue repeats", "delivery artifact has no material change", "verifier output is unchanged"]}`
 
 ## Execution Boundary
@@ -82,5 +82,5 @@ A LOOP.md-style workflow map exists, every step has an owner, input, output, and
 | all gates clean                |
 +--------------------------------+
 
-Stops: pass gates | max 12 iterations | no progress x2 | budget 30m, $5.0, 2000000 tokens
+Stops: pass gates | max 12 iterations | no progress x2 | budget 30m, 2000000 tokens
 ```

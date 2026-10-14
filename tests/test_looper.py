@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 
 
@@ -1120,6 +1122,37 @@ class LintTests(unittest.TestCase):
             self.assertIn("warning[missing-max-revisions]", result.stdout)
             self.assertIn("warning[delivery-gate-no-programmatic]", result.stdout)
 
+    def test_budget_caps_error_on_unmetered_invokes_and_warn_on_unknown_ones(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            work = self._setup_work(tmp)
+            self._mutate(work, "    wall_clock_min: 5\n", "    wall_clock_min: 5\n    tokens: 1000\n    usd: 2.0\n")
+            # Fixture scripts: the runner cannot judge them from argv.
+            result = self._lint(work)
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertIn("budget.tokens: cannot tell from the invoke whether host, reviewer-1", result.stdout)
+            # The fixture judge is local: free, so only the host is unknown for USD.
+            self.assertIn("budget.usd: cannot tell from the invoke whether host report", result.stdout)
+            self.assertNotIn("error[", result.stdout)
+
+            python = Path(sys.executable).as_posix()
+            host_invoke = f'invoke: ["{python}", "{(FIXTURES / "fake_host.py").as_posix()}"]'
+            self._mutate(work, host_invoke, 'invoke: ["claude", "-p"]')
+            result = self._lint(work)
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("error[unmetered-budget]: loop_control.budget.tokens cannot be enforced for host", result.stdout)
+            self.assertIn("error[unmetered-budget]: loop_control.budget.usd cannot be enforced for host", result.stdout)
+
+            self._mutate(work, 'invoke: ["claude", "-p"]', 'invoke: ["claude", "-p", "--output-format", "json"]')
+            result = self._lint(work)
+            self.assertNotIn("unmetered-budget", result.stdout)
+            self.assertNotIn("budget.usd", result.stdout)
+            self.assertIn("budget.tokens: cannot tell from the invoke whether reviewer-1", result.stdout)
+
+            self._mutate(work, 'invoke: ["claude", "-p", "--output-format", "json"]', 'invoke: ["codex", "exec", "--json"]')
+            result = self._lint(work)
+            self.assertIn("error[unmetered-budget]: loop_control.budget.usd cannot be enforced for host", result.stdout)
+            self.assertNotIn("budget.tokens cannot be enforced", result.stdout)
+
     def test_json_output_matches_counts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             work = Path(tmp)
@@ -1299,6 +1332,512 @@ class CrashStateTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             state = json.loads((work / "loop-workspace" / "state.json").read_text(encoding="utf-8"))
             self.assertNotEqual(state["status"], "running", state)
+
+
+def load_runner_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("run_loop_under_test", RUNNER_TEMPLATE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class BudgetTests(unittest.TestCase):
+    def _setup_work(
+        self,
+        tmp: str,
+        *,
+        host: tuple[str, int, float] | None,
+        judge: tuple[str, int, float] | None,
+        budget: str,
+        judge_local: bool = True,
+    ) -> Path:
+        work = Path(tmp)
+        (work / "inputs").mkdir()
+        (work / "inputs" / "process-notes.md").write_text("Need a useful loop.\n", encoding="utf-8")
+        write_loop_yaml(work / "loop.yaml", judge_local=judge_local)
+        python = Path(sys.executable).as_posix()
+        metered = (FIXTURES / "metered.py").as_posix()
+        text = (work / "loop.yaml").read_text(encoding="utf-8")
+        for wrap, script in ((host, "fake_host.py"), (judge, "fake_judge.py")):
+            if wrap is None:
+                continue
+            fmt, tokens, usd = wrap
+            original = f'"{python}", "{(FIXTURES / script).as_posix()}"'
+            self.assertIn(original, text)
+            text = text.replace(original, f'"{python}", "{metered}", "{fmt}", "{tokens}", "{usd}", {original}')
+        text = text.replace("    wall_clock_min: 5\n", f"    wall_clock_min: 5\n{budget}")
+        (work / "loop.yaml").write_text(text, encoding="utf-8")
+        shutil.copyfile(RUNNER_TEMPLATE, work / "run-loop.py")
+        self._compile(work)
+        return work
+
+    def _compile(self, work: Path) -> None:
+        compiled = run_cmd(
+            [sys.executable, str(LOOPER), "compile", "loop.yaml", "--out", "loop.resolved.json"], work
+        )
+        self.assertEqual(compiled.returncode, 0, compiled.stderr)
+
+    def _run(self, work: Path, stdin: str = "") -> subprocess.CompletedProcess[str]:
+        return run_cmd([sys.executable, "run-loop.py"], work, stdin=stdin)
+
+    def _state(self, work: Path) -> dict:
+        return json.loads((work / "loop-workspace" / "state.json").read_text(encoding="utf-8"))
+
+    def _judge_calls(self, work: Path) -> int:
+        path = work / "judge-state.json"
+        return json.loads(path.read_text(encoding="utf-8"))["count"] if path.exists() else 0
+
+    def test_token_cap_with_non_local_judge_stops_run_and_holds_on_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # host 400/call (claude JSON), non-local judge 300/call (codex
+            # JSONL): plan 400, verdict 700, revision 1100 > 1000 -> stop
+            # before the next verdict.
+            work = self._setup_work(
+                tmp,
+                host=("claude", 400, 0.01),
+                judge=("codex", 300, 0),
+                budget="    tokens: 1000\n",
+                judge_local=False,
+            )
+            result = self._run(work, stdin="yes\n")
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("Token budget exceeded: 1100 of 1000", result.stderr)
+            state = self._state(work)
+            self.assertEqual(state["status"], "failed")
+            self.assertEqual(state["failure"], "token_budget_exceeded")
+            self.assertIn("reviewer-1", state["consent"])
+            self.assertEqual(state["usage"]["tokens"], 1100)
+            self.assertEqual(state["usage"]["calls"], 3)
+            self.assertEqual(state["usage"]["by_member"]["host"]["tokens"], 800)
+            self.assertEqual(state["usage"]["by_member"]["reviewer-1"]["tokens"], 300)
+            self.assertEqual(self._judge_calls(work), 1)
+            self.assertFalse((work / "loop-workspace" / "delivery-1.md").exists())
+            # The response text is unwrapped from the CLI's JSON envelope.
+            plan = (work / "loop-workspace" / "plan.md").read_text(encoding="utf-8")
+            self.assertTrue(plan.startswith("Revised artifact"), plan)
+            log = (work / "loop-workspace" / "run-log.md").read_text(encoding="utf-8")
+            self.assertIn('"reason": "token_budget_exceeded"', log)
+            self.assertIn("`model_usage`", log)
+
+            # Usage accrues across resumes: a rerun stops before any call.
+            rerun = self._run(work)
+            self.assertEqual(rerun.returncode, 2, rerun.stdout + rerun.stderr)
+            self.assertIn("Token budget exceeded: 1100 of 1000", rerun.stderr)
+            state = self._state(work)
+            self.assertEqual(state["status"], "failed")
+            self.assertEqual(state["failure"], "token_budget_exceeded")
+            self.assertEqual(state["usage"]["calls"], 3)
+            # Neither model process ran: the judge's own counter is unchanged
+            # and the host did not rewrite the plan.
+            self.assertEqual(self._judge_calls(work), 1)
+            self.assertEqual((work / "loop-workspace" / "plan.md").read_text(encoding="utf-8"), plan)
+            log = (work / "loop-workspace" / "run-log.md").read_text(encoding="utf-8")
+            self.assertEqual(log.count('"reason": "token_budget_exceeded"'), 2)
+            self.assertNotIn("`host_start`", log.split("`run_start`")[-1])
+
+    def test_usd_cap_crossed_by_non_local_judge_stops_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # host $0.10/call, non-local judge $0.40/call (both claude JSON):
+            # plan .10, verdict .50, revision .60, passing verdict 1.00 > .90
+            # -> the judge's spend crosses the cap and no delivery is drafted.
+            work = self._setup_work(
+                tmp,
+                host=("claude", 10, 0.1),
+                judge=("claude", 10, 0.4),
+                budget="    usd: 0.9\n",
+                judge_local=False,
+            )
+            result = self._run(work, stdin="yes\n")
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("USD budget exceeded", result.stderr)
+            state = self._state(work)
+            self.assertEqual(state["failure"], "usd_budget_exceeded")
+            self.assertAlmostEqual(state["usage"]["usd"], 1.0)
+            self.assertAlmostEqual(state["usage"]["by_member"]["reviewer-1"]["usd"], 0.8)
+            self.assertAlmostEqual(state["usage"]["by_member"]["host"]["usd"], 0.2)
+            self.assertEqual(self._judge_calls(work), 2)
+            self.assertTrue((work / "loop-workspace" / "plan.md").exists())
+            self.assertFalse((work / "loop-workspace" / "delivery-1.md").exists())
+            self.assertNotIn("untracked_calls", state["usage"])
+
+    def test_usd_cap_with_local_judge_stops_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # A local judge is free; host plan + revision = $1.00 (under
+            # $1.20), plan passes, delivery host call = $1.50 -> stop.
+            work = self._setup_work(
+                tmp, host=("claude", 10, 0.5), judge=("codex", 10, 0), budget="    usd: 1.2\n"
+            )
+            result = self._run(work)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("USD budget exceeded", result.stderr)
+            state = self._state(work)
+            self.assertEqual(state["failure"], "usd_budget_exceeded")
+            self.assertAlmostEqual(state["usage"]["usd"], 1.5)
+            self.assertEqual(state["usage"]["by_member"]["reviewer-1"]["usd"], 0.0)
+            self.assertTrue((work / "loop-workspace" / "delivery-1.md").exists())
+
+    def test_metered_run_within_caps_passes_and_records_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            work = self._setup_work(
+                tmp,
+                host=("claude", 100, 0.02),
+                judge=("codex-plain", 1234, 0),
+                budget="    tokens: 100000\n    usd: 5.0\n",
+            )
+            result = self._run(work)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            state = self._state(work)
+            self.assertEqual(state["status"], "passed")
+            judge = state["usage"]["by_member"]["reviewer-1"]
+            self.assertEqual(judge["tokens"], 1234 * judge["calls"])
+            delivery = (work / "loop-workspace" / "delivery-1.md").read_text(encoding="utf-8")
+            self.assertIn("Owner: host", delivery)
+            self.assertNotIn('"usage"', delivery)
+
+    def test_host_reporting_no_tokens_fails_closed_on_first_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # The plain fake host is a script the runner cannot judge from
+            # argv, so it runs once; reporting nothing then ends the run.
+            work = self._setup_work(tmp, host=None, judge=("codex", 10, 0), budget="    tokens: 1000\n")
+            result = self._run(work)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("budget.tokens cannot be enforced: host", result.stderr)
+            state = self._state(work)
+            self.assertEqual(state["status"], "failed")
+            self.assertEqual(state["failure"], "budget_unenforceable:tokens:host")
+            self.assertEqual(state["usage"]["calls"], 1)
+            self.assertEqual(self._judge_calls(work), 0)
+
+    def test_non_local_judge_reporting_no_usd_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # Host reports cost; the non-local codex-format judge reports
+            # tokens only, so a USD cap cannot count it: stop after its call.
+            work = self._setup_work(
+                tmp,
+                host=("claude", 10, 0.01),
+                judge=("codex", 10, 0),
+                budget="    usd: 5.0\n",
+                judge_local=False,
+            )
+            result = self._run(work, stdin="yes\n")
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("budget.usd cannot be enforced: reviewer-1", result.stderr)
+            state = self._state(work)
+            self.assertEqual(state["status"], "failed")
+            self.assertEqual(state["failure"], "budget_unenforceable:usd:reviewer-1")
+            self.assertEqual(self._judge_calls(work), 1)
+            self.assertEqual(state["usage"]["by_member"]["reviewer-1"]["tokens"], 10)
+            self.assertFalse((work / "loop-workspace" / "review-plan_gate-1.md").exists())
+
+    def test_codex_host_with_only_usd_cap_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            work = self._setup_work(tmp, host=("codex", 500, 0), judge=None, budget="    usd: 5.0\n")
+            result = self._run(work)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("budget.usd cannot be enforced: host", result.stderr)
+            state = self._state(work)
+            self.assertEqual(state["failure"], "budget_unenforceable:usd:host")
+            self.assertEqual(state["usage"]["by_member"]["host"]["tokens"], 500)
+            self.assertEqual(self._judge_calls(work), 0)
+
+    def test_known_unmetered_invokes_are_refused_before_any_call(self) -> None:
+        # A CLI the runner knows reports nothing is refused at preflight, so
+        # nothing is spent. The stand-in executables record any invocation.
+        cases = [
+            ("claude", ["-p"], "    tokens: 1000\n", "budget_unenforceable:tokens:host"),
+            ("codex", ["exec", "--json"], "    usd: 5.0\n", "budget_unenforceable:usd:host"),
+        ]
+        for exe, args, budget, failure in cases:
+            with self.subTest(exe), tempfile.TemporaryDirectory() as tmp:
+                work = self._setup_work(tmp, host=None, judge=None, budget=budget)
+                stand_in = work / "bin" / exe
+                stand_in.parent.mkdir()
+                marker = (work / "invoked").as_posix()
+                stand_in.write_text(
+                    f"#!{Path(sys.executable).as_posix()}\nopen({marker!r}, 'w').close()\n", encoding="utf-8"
+                )
+                stand_in.chmod(0o755)
+                python = Path(sys.executable).as_posix()
+                text = (work / "loop.yaml").read_text(encoding="utf-8")
+                host_invoke = f'["{python}", "{(FIXTURES / "fake_host.py").as_posix()}"]'
+                self.assertIn(host_invoke, text)
+                argv = ", ".join(f'"{item}"' for item in [stand_in.as_posix(), *args])
+                (work / "loop.yaml").write_text(text.replace(host_invoke, f"[{argv}]"), encoding="utf-8")
+                self._compile(work)
+
+                result = self._run(work)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertFalse((work / "invoked").exists(), "model CLI was invoked despite preflight")
+                state = self._state(work)
+                self.assertEqual(state["status"], "blocked")
+                self.assertEqual(state["failure"], failure)
+                self.assertNotIn("usage", state)
+                self.assertEqual(self._judge_calls(work), 0)
+
+    def test_runner_and_lint_agree_on_which_invokes_meter(self) -> None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("looper_under_test", LOOPER)
+        looper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(looper)
+        runner = load_runner_module()
+        invokes = [
+            ["claude", "-p"], ["claude", "-p", "--output-format", "json"],
+            ["claude", "-p", "--output-format=stream-json"], ["claude", "-p", "--output-format", "text"],
+            ["/usr/local/bin/claude.exe", "-p", "--output-format", "json"],
+            ["codex", "exec"], ["codex", "exec", "--json"], ["codex"],
+            ["gemini", "-p"], ["llm"], ["ollama", "run"], ["python", "wrapper.py"],
+        ]
+        for argv in invokes:
+            for local in (False, True):
+                for key in ("tokens", "usd"):
+                    member = {"invoke": argv, "local": local}
+                    self.assertEqual(
+                        runner.invoke_meters(member, key), looper.invoke_meters(member, key), (argv, local, key)
+                    )
+
+    def _stand_in(self, work: Path, name: str, script: Path) -> Path:
+        """An executable named like a real CLI (so the runner treats it as one)."""
+        directory = work / "bin"
+        directory.mkdir(exist_ok=True)
+        if os.name == "nt":
+            path = directory / f"{name}.cmd"
+            path.write_text(f'@"{sys.executable}" "{script}" %*\r\n', encoding="utf-8")
+        else:
+            path = directory / name
+            path.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n', encoding="utf-8")
+            path.chmod(0o755)
+        return path
+
+    def _use_fake_claude_host(self, work: Path, turns: int, usd_per_turn: float) -> Path:
+        claude = self._stand_in(work, "claude", FIXTURES / "fake_claude.py")
+        argv_log = work / "claude-argv.jsonl"
+        python = Path(sys.executable).as_posix()
+        host_invoke = f'["{python}", "{(FIXTURES / "fake_host.py").as_posix()}"]'
+        invoke = [
+            "-p", "--output-format", "json",
+            argv_log.as_posix(), str(turns), str(usd_per_turn), "100",
+            "--", python, (FIXTURES / "fake_host.py").as_posix(),
+        ]
+        text = (work / "loop.yaml").read_text(encoding="utf-8")
+        self.assertIn(host_invoke, text)
+        # Native path, YAML single-quoted (no escapes): Windows runs a .cmd
+        # through cmd.exe, which can misread forward slashes as switches.
+        rendered = [f"'{claude}'"] + [f'"{item}"' for item in invoke]
+        (work / "loop.yaml").write_text(
+            text.replace(host_invoke, "[" + ", ".join(rendered) + "]"), encoding="utf-8"
+        )
+        self._compile(work)
+        return argv_log
+
+    def _usd_ceilings(self, argv_log: Path) -> list[str]:
+        ceilings = []
+        for line in argv_log.read_text(encoding="utf-8").splitlines():
+            argv = json.loads(line)
+            ceilings.append(argv[argv.index("--max-budget-usd") + 1])
+        return ceilings
+
+    def test_claude_host_gets_remaining_usd_and_stops_itself_mid_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # One host call that would grind 10 turns x $0.30 = $3.00 on a
+            # $1.00 budget. Handed --max-budget-usd 1.0, it stops itself after
+            # the turn that reaches the ceiling ($1.20), and that failed
+            # call's reported cost is still counted.
+            work = self._setup_work(tmp, host=None, judge=("codex", 10, 0), budget="    usd: 1.0\n")
+            argv_log = self._use_fake_claude_host(work, turns=10, usd_per_turn=0.3)
+            result = self._run(work)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("--max-budget-usd ceiling", result.stderr)
+            self.assertEqual(self._usd_ceilings(argv_log), ["1.000000"])
+            state = self._state(work)
+            self.assertEqual(state["status"], "failed")
+            self.assertEqual(state["failure"], "usd_budget_exceeded")
+            self.assertAlmostEqual(state["usage"]["usd"], 1.2)
+            self.assertEqual(state["usage"]["by_member"]["host"]["calls"], 1)
+            self.assertFalse((work / "loop-workspace" / "plan.md").exists())
+            self.assertEqual(self._judge_calls(work), 0)
+
+    def test_each_claude_call_gets_only_what_is_left(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # $0.30 per host call on $1.00: plan, revision, delivery are
+            # handed 1.00, 0.70, 0.40 and the run passes at $0.90.
+            work = self._setup_work(tmp, host=None, judge=("codex", 10, 0), budget="    usd: 1.0\n")
+            argv_log = self._use_fake_claude_host(work, turns=1, usd_per_turn=0.3)
+            result = self._run(work)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self._usd_ceilings(argv_log), ["1.000000", "0.700000", "0.400000"])
+            self.assertAlmostEqual(self._state(work)["usage"]["usd"], 0.9)
+
+    def test_remaining_wall_clock_caps_a_hanging_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # A host that hangs far past its own 30s timeout_sec is killed
+            # when the 3-second loop budget runs out, not 30s later.
+            work = self._setup_work(tmp, host=None, judge=None, budget="")
+            hang = work / "hang.py"
+            hang.write_text("import sys, time\nsys.stdin.read()\ntime.sleep(120)\n", encoding="utf-8")
+            python = Path(sys.executable).as_posix()
+            text = (work / "loop.yaml").read_text(encoding="utf-8")
+            text = text.replace(
+                f'["{python}", "{(FIXTURES / "fake_host.py").as_posix()}"]', f'["{python}", "{hang.as_posix()}"]'
+            ).replace("wall_clock_min: 5", "wall_clock_min: 0.05")
+            (work / "loop.yaml").write_text(text, encoding="utf-8")
+            self._compile(work)
+            started = time.monotonic()
+            result = self._run(work)
+            elapsed = time.monotonic() - started
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertLess(elapsed, 20, "call ran to its own timeout instead of the loop budget")
+            state = self._state(work)
+            self.assertEqual(state["failure"], "wall_clock_budget_exceeded")
+            self.assertIn("host was stopped when the budget ran out", result.stderr)
+
+    def _use_spawning_host(self, work: Path, mode: str, wall_clock_min: str = "5") -> Path:
+        beats = work / "beats"
+        python = Path(sys.executable).as_posix()
+        text = (work / "loop.yaml").read_text(encoding="utf-8")
+        host_invoke = f'["{python}", "{(FIXTURES / "fake_host.py").as_posix()}"]'
+        self.assertIn(host_invoke, text)
+        text = text.replace(
+            host_invoke,
+            f'["{python}", "{(FIXTURES / "spawning_host.py").as_posix()}", "{mode}", "{beats.as_posix()}"]',
+        ).replace("wall_clock_min: 5", f"wall_clock_min: {wall_clock_min}")
+        (work / "loop.yaml").write_text(text, encoding="utf-8")
+        self._compile(work)
+        return beats
+
+    def _live_tools(self, beats: Path) -> list[str]:
+        """Tool processes still heartbeating (each appends every 0.1s)."""
+        def sizes() -> dict[str, int]:
+            return {f.name: f.stat().st_size for f in beats.iterdir()} if beats.exists() else {}
+        before = sizes()
+        time.sleep(0.8)
+        after = sizes()
+        return sorted(name for name, size in after.items() if size > before.get(name, 0))
+
+    def test_timeout_kill_takes_down_detached_tool_processes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # The host hangs with a tool running in its own session; when the
+            # 3-second budget runs out, the tool must die with it rather than
+            # keep working (and spending) as an orphan.
+            work = self._setup_work(tmp, host=None, judge=None, budget="")
+            beats = self._use_spawning_host(work, "hang", wall_clock_min="0.05")
+            result = self._run(work)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertEqual(self._state(work)["failure"], "wall_clock_budget_exceeded")
+            self.assertTrue(beats.exists() and any(beats.iterdir()), "tool never started")
+            self.assertEqual(self._live_tools(beats), [], "tool outlived the killed host")
+
+    @unittest.skipIf(
+        sys.platform == "darwin",
+        "macOS has no subreaper: a detached tool left behind by a CLI that already exited cleanly "
+        "cannot be traced by parentage (documented limitation)",
+    )
+    def test_tools_left_behind_by_a_finished_call_are_killed_and_do_not_stall_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # Every host call finishes at once but leaves a detached tool
+            # holding stdout. The call must complete without waiting out the
+            # host's 30s timeout_sec, and the tool must not survive it.
+            work = self._setup_work(tmp, host=None, judge=("codex", 10, 0), budget="")
+            beats = self._use_spawning_host(work, "finish")
+            started = time.monotonic()
+            result = self._run(work)
+            elapsed = time.monotonic() - started
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertLess(elapsed, 25, "a leftover tool holding stdout stalled the call")
+            state = self._state(work)
+            self.assertEqual(state["status"], "passed")
+            host_calls = state["usage"]["by_member"]["host"]["calls"]
+            self.assertEqual(len(list(beats.iterdir())), host_calls)
+            self.assertEqual(self._live_tools(beats), [], "tools outlived the calls that started them")
+
+    @unittest.skipIf(os.name == "nt", "SIGTERM handling is POSIX-only")
+    def test_sigterm_to_runner_kills_model_tree_and_leaves_terminal_state(self) -> None:
+        import signal
+
+        with tempfile.TemporaryDirectory() as tmp:
+            work = self._setup_work(tmp, host=None, judge=None, budget="")
+            beats = self._use_spawning_host(work, "hang")
+            runner = subprocess.Popen(
+                [sys.executable, "run-loop.py"], cwd=str(work),
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                deadline = time.monotonic() + 20
+                while not (beats.exists() and any(beats.iterdir())) and time.monotonic() < deadline:
+                    time.sleep(0.1)
+                self.assertTrue(beats.exists() and any(beats.iterdir()), "tool never started")
+                runner.send_signal(signal.SIGTERM)
+                runner.communicate(timeout=20)
+            finally:
+                if runner.poll() is None:
+                    runner.kill()
+            self.assertEqual(runner.returncode, 128 + signal.SIGTERM)
+            self.assertEqual(self._live_tools(beats), [], "tool outlived the terminated runner")
+            self.assertEqual(self._state(work)["status"], "failed")
+
+    def test_usd_ceiling_flag_handling(self) -> None:
+        runner = load_runner_module()
+        self.assertEqual(
+            runner.with_usd_ceiling(["claude", "-p"], 0.75), ["claude", "-p", "--max-budget-usd", "0.750000"]
+        )
+        # Rounds down: never grant more than is left.
+        self.assertEqual(runner.with_usd_ceiling(["claude"], 0.3333339)[-1], "0.333333")
+        # An operator's own per-call ceiling is kept when it is lower...
+        self.assertEqual(
+            runner.with_usd_ceiling(["claude", "--max-budget-usd", "0.10", "-p"], 0.75),
+            ["claude", "--max-budget-usd", "0.100000", "-p"],
+        )
+        # ...and lowered to the remaining budget when it is higher.
+        self.assertEqual(
+            runner.with_usd_ceiling(["claude", "--max-budget-usd=5", "-p"], 0.75),
+            ["claude", "--max-budget-usd=0.750000", "-p"],
+        )
+
+    def test_parse_model_output_formats(self) -> None:
+        runner = load_runner_module()
+        text, usage = runner.parse_model_output("plain answer\n", "")
+        self.assertEqual((text, usage), ("plain answer", None))
+        # A judge printing a bare JSON verdict is not mistaken for a CLI envelope.
+        text, usage = runner.parse_model_output('{"verdict": "pass"}', "")
+        self.assertEqual((text, usage), ('{"verdict": "pass"}', None))
+        text, usage = runner.parse_model_output("done\n", "header\ntokens used: 12,345\n")
+        self.assertEqual(usage, {"tokens": 12345, "usd": None})
+        claude_stream = "\n".join([
+            json.dumps({"type": "system", "subtype": "init"}),
+            json.dumps({"type": "result", "result": "hi", "total_cost_usd": 0.25,
+                        "usage": {"input_tokens": 1, "cache_read_input_tokens": 10, "output_tokens": 2}}),
+        ])
+        text, usage = runner.parse_model_output(claude_stream, "")
+        self.assertEqual(text, "hi")
+        self.assertEqual((usage["tokens"], usage["usd"]), (13, 0.25))
+        with self.assertRaises(runner.RunnerError):
+            runner.parse_model_output(
+                json.dumps({"type": "result", "is_error": True, "result": "overloaded", "usage": {}}), ""
+            )
+        # Shape of a real `--max-budget-usd` stop: `usage` zeroed, the spend
+        # only in modelUsage / total_cost_usd - and it must survive the error.
+        budget_stop = {
+            "type": "result", "subtype": "error_max_budget_usd", "is_error": True, "result": "",
+            "total_cost_usd": 0.158168,
+            "usage": {"input_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 0},
+            "modelUsage": {
+                "claude-opus-5-5": {"inputTokens": 2, "outputTokens": 570, "cacheReadInputTokens": 0,
+                                    "cacheCreationInputTokens": 29352, "costUSD": 0.158168},
+                "claude-haiku-5-5": {"inputTokens": 100, "outputTokens": 10, "cacheReadInputTokens": 0,
+                                     "cacheCreationInputTokens": 0, "costUSD": 0.0},
+            },
+        }
+        with self.assertRaises(runner.ModelError) as caught:
+            runner.parse_model_output(json.dumps(budget_stop), "")
+        self.assertEqual(caught.exception.kind, "error_max_budget_usd")
+        self.assertEqual(caught.exception.usage["tokens"], 2 + 570 + 29352 + 100 + 10)
+        self.assertEqual(caught.exception.usage["usd"], 0.158168)
+        with self.assertRaises(runner.RunnerError):
+            runner.parse_model_output(
+                json.dumps({"type": "turn.failed", "error": {"message": "401"}}), ""
+            )
 
 
 class ConformanceTests(unittest.TestCase):

@@ -42,7 +42,17 @@ versioned with the spec format: this file describes runners for spec
 
 - Every model call MUST use the member's `invoke` argv array verbatim — no
   shell string interpolation — with the prompt on stdin, and MUST apply the
-  member's `timeout_sec`.
+  member's `timeout_sec` (as an upper bound; see section 5). The one
+  permitted change: when a USD cap is set, a runner MAY append (or lower an
+  existing) `--max-budget-usd <remaining>` on a non-local `claude` invoke.
+- A model call's subprocess and everything it spawned — model CLIs run
+  tools in child processes, and Claude Code starts each Bash tool in its
+  own session, beyond a process-group kill — MUST be terminated together
+  when the runner abandons the call (timeout, budget, or the runner being
+  interrupted/terminated). Killing only the CLI orphans its tools to keep
+  working outside every budget. A runner SHOULD also terminate descendants
+  still running when a call exits normally, and MUST NOT let one holding
+  the output pipe stall a finished call until its timeout.
 - Programmatic checks MUST run their `check` argv with `timeout_sec` and
   evaluate `expect` as: `exit_zero` (return code 0), `exit_nonzero`
   (non-zero), `stdout_contains` (the `contains` string appears in stdout).
@@ -52,6 +62,21 @@ versioned with the spec format: this file describes runners for spec
   `inputs/...`).
 - Model and check subprocess output MUST be decoded as UTF-8 (with
   replacement on errors), not the platform locale codepage.
+- A runner MUST recognize the usage-reporting output formats of the known
+  CLIs and take the response text from them rather than using the raw
+  envelope as the artifact:
+  - Claude `-p --output-format json` / `stream-json`: the `type: "result"`
+    event; text is `result`, cost is `total_cost_usd`, tokens are input +
+    output + cache-creation + cache-read input tokens summed over
+    `modelUsage` (falling back to `usage` when absent — error results zero
+    `usage`). `is_error: true` is a failed invocation; its reported usage is
+    still real spend and MUST be counted.
+  - Codex `exec --json`: JSONL events; text is the last `item.completed`
+    whose item `type` is `agent_message`, tokens are `input_tokens` +
+    `output_tokens` summed over `turn.completed` events (cached and reasoning
+    tokens are already inside those). `turn.failed` is a failed invocation.
+    Plain `codex exec` reports only a `tokens used` total on stderr.
+  - Any other output is the response text verbatim, with no usage.
 
 ## 4. Gates and verdicts
 
@@ -85,8 +110,26 @@ versioned with the spec format: this file describes runners for spec
 - The wall-clock budget (`loop_control.budget.wall_clock_min`) MUST be
   enforced at least at step boundaries, and elapsed time MUST accumulate
   across resumed runs (persisted in state).
-- Token / USD budgets are advisory unless the runner has real accounting; a
-  runner MUST NOT claim to enforce them when it cannot measure them.
+- Token / USD budgets (`loop_control.budget.tokens` / `.usd`) MUST be
+  enforced against the usage reported by model calls (section 3), accrued
+  across resumed runs (persisted in state). Once a cap is reached the runner
+  MUST NOT start another model call and MUST end the run `failed`.
+- A runner SHOULD hand the remaining budget down to each call where the CLI
+  can enforce it: cap the subprocess timeout at the remaining wall clock (a
+  call killed this way ends the run on the wall-clock cap), and pass Claude
+  the remaining USD as `--max-budget-usd` (an `error_max_budget_usd` result
+  ends the run on the USD cap). Claude checks that ceiling between API
+  turns, so a call overshoots by at most one turn; token caps and Codex have
+  no per-call lever, so there the call that crosses a cap completes and the
+  overshoot is bounded by one call.
+- Token / USD caps fail closed: an unenforceable cap is worse than none.
+  When a cap is set, a call that reports no tokens (or no cost, for a
+  non-local member) MUST end the run `failed` before any further model call;
+  the runner MUST NOT count it as zero. A runner SHOULD refuse the run
+  (`blocked`) before the first call when the invoke argv shows a member
+  cannot report the capped measure (plain `claude -p`; any Codex invoke
+  under a USD cap). Local members cost nothing in USD; there is no such
+  exemption for tokens.
 - No-progress: the runner MUST derive a signature from a gate round's
   failures; when the same gate yields the same signature
   `max_stalled_iterations` times consecutively, the configured action fires:
@@ -149,7 +192,7 @@ versioned with the spec format: this file describes runners for spec
 - The split among non-zero codes is a SHOULD: `1` for a loop that ran and
   failed (gate exhaustion, iteration cap, no-progress), `2` for a runner
   refusal or error (bad spec, bad paths, consent refused, interactive input
-  unavailable). The reference runner maps a wall-clock budget abort to `2`
+  unavailable). The reference runner maps a budget abort (wall-clock, token, or USD) to `2`
   (it is raised as a runner error); tooling that needs to distinguish
   failure classes should read the state file's `status`/`failure`, which is
   the normative record, rather than the 1-vs-2 split.
@@ -167,7 +210,10 @@ no real model CLIs needed), invokes your runner in each, and asserts the
 observable obligations above: happy path, judge-degrade (with real revision
 rounds), consent fail-closed, prompt redaction, host-prompt scrub, default
 redaction globs, context non-send, cmd-output scrub, workspace escape
-refusal, and revision-cap failure (with a stall-proof judge, so a no-progress
-detector cannot mask a missing cap). Every scenario must pass for a
+refusal, revision-cap failure (with a stall-proof judge, so a no-progress
+detector cannot mask a missing cap), token-cap enforcement from a host and
+judge reporting Claude-format usage, fail-closed refusal of a token cap the
+host's calls cannot be counted against, and process-tree termination of a
+call cut off by the wall-clock budget. Every scenario must pass for a
 conformance claim. The reference runner is checked in CI against this same
 suite.

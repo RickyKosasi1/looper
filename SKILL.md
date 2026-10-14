@@ -200,7 +200,7 @@ Use this shape and customize labels:
 | all gates clean                |
 +--------------------------------+
 
-Stops: pass gates | max 12 iterations | no progress x2 | budget 30m, $5.0, 2000000 tokens
+Stops: pass gates | max 12 iterations | no progress x2 | budget 30m, 2000000 tokens
 ```
 
 ## Emit Checklist
